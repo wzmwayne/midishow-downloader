@@ -1,0 +1,312 @@
+// ==UserScript==
+// @name         MidiShow 下载器 (自动 + 菜单)
+// @namespace    http://tampermonkey.net/
+// @version      2.0
+// @description  自动下载 MidiShow MIDI 文件，支持进度条与状态提示，也可通过菜单触发
+// @match        *://www.midishow.com/*
+// @grant        GM_xmlhttpRequest
+// @grant        GM_registerMenuCommand
+// @grant        GM_notification
+// @connect      www.midishow.com
+// @connect      s.midishow.net
+// @run-at       document-end
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // ========== 核心解码函数 ==========
+
+    function etagDecode(origin) {
+        let t = "";
+        for (let e = 0; e < origin.length && origin.substring(e, e + 2) !== "00"; e += 2) {
+            t += String.fromCharCode(parseInt(origin.substring(e, e + 2), 16));
+        }
+        return t;
+    }
+
+    function de(t, e) {
+        let n, i, s, r, o, a, h = "", u = 0;
+        while (u < t.length) {
+            n = e.indexOf(t.charAt(u++)) << 2 | (r = e.indexOf(t.charAt(u++))) >> 4;
+            i = (15 & r) << 4 | (o = e.indexOf(t.charAt(u++))) >> 2;
+            s = (3 & o) << 6 | (a = e.indexOf(t.charAt(u++)));
+            h += String.fromCharCode(n);
+            if (64 != o) h += String.fromCharCode(i);
+            if (64 != a) h += String.fromCharCode(s);
+        }
+        return h;
+    }
+
+    function getMidiId() {
+        const url = window.location.href;
+        let match = url.match(/\/midi\/(\d+)\.html/);
+        if (match) return parseInt(match[1]);
+        match = url.match(/[?&]id=(\d+)/);
+        if (match) return parseInt(match[1]);
+        match = url.match(/\/midi\/[\w-]+(\d{6})$/);
+        if (match) return parseInt(match[1]);
+        match = url.match(/\b(\d{6})\b/);
+        if (match) return parseInt(match[1]);
+        return null;
+    }
+
+    function isDownloadPage() {
+        return window.location.pathname.includes('/midi/download');
+    }
+
+    // ========== UI 元素（简约风格） ==========
+
+    let progressBar = null;
+    let statusText = null;
+    let statusContainer = null;
+
+    function createUI() {
+        // 创建容器（固定在右下角）
+        const container = document.createElement('div');
+        container.id = 'midi-downloader-ui';
+        container.style.cssText = `
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            width: 280px;
+            background: rgba(0,0,0,0.85);
+            color: #fff;
+            padding: 12px 16px;
+            border-radius: 8px;
+            font-family: Arial, sans-serif;
+            font-size: 13px;
+            z-index: 999999;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+            display: none;
+            border: 1px solid #444;
+        `;
+        document.body.appendChild(container);
+
+        // 状态文字
+        const text = document.createElement('div');
+        text.id = 'midi-status-text';
+        text.style.cssText = 'margin-bottom: 8px; word-break: break-all;';
+        text.textContent = '就绪';
+        container.appendChild(text);
+
+        // 进度条容器
+        const barWrap = document.createElement('div');
+        barWrap.style.cssText = 'width:100%; background:#333; border-radius:4px; height:6px; overflow:hidden;';
+        const bar = document.createElement('div');
+        bar.id = 'midi-progress-bar';
+        bar.style.cssText = 'width:0%; height:100%; background:#4a9eff; transition: width 0.2s ease;';
+        barWrap.appendChild(bar);
+        container.appendChild(barWrap);
+
+        statusContainer = container;
+        statusText = text;
+        progressBar = bar;
+    }
+
+    function showUI() {
+        if (statusContainer) statusContainer.style.display = 'block';
+    }
+
+    function hideUI() {
+        if (statusContainer) statusContainer.style.display = 'none';
+    }
+
+    function setStatus(msg) {
+        if (statusText) statusText.textContent = msg;
+        console.log('[MidiDownload]', msg);
+    }
+
+    function setProgress(pct) {
+        if (progressBar) progressBar.style.width = Math.min(100, Math.max(0, pct)) + '%';
+    }
+
+    // ========== 下载核心 ==========
+
+    async function handleDownload(id) {
+        // 显示 UI
+        showUI();
+        setStatus('开始下载...');
+        setProgress(0);
+
+        try {
+            const csrf = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
+            if (!csrf) throw new Error('未找到 CSRF Token');
+            setStatus('获取 CSRF Token...');
+            setProgress(10);
+
+            const midiDiv = document.querySelector(`div[data-id="${id}"]`);
+            const midiLink = midiDiv?.getAttribute('data-mid');
+            if (!midiLink) throw new Error('未找到 data-mid');
+            setStatus('获取文件链接...');
+            setProgress(20);
+
+            const cookies = document.cookie;
+
+            setStatus('请求第一段数据...');
+            setProgress(30);
+            const data1 = await new Promise((resolve, reject) => {
+                GM_xmlhttpRequest({
+                    method: 'POST',
+                    url: `https://www.midishow.com/midi/new-file?id=${id}`,
+                    headers: {
+                        'X-CSRF-TOKEN': csrf,
+                        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                        'X-Requested-With': 'XMLHttpRequest',
+                        'Referer': window.location.href,
+                        'Cookie': cookies
+                    },
+                    data: `id=${id}`,
+                    anonymous: false,
+                    onload: (response) => {
+                        if (response.status === 200) {
+                            const etagMatch = response.responseHeaders.match(/etag:\s*"?([^"\r\n]+)/i);
+                            resolve({
+                                data: response.responseText,
+                                etag: etagMatch ? etagMatch[1] : ''
+                            });
+                        } else {
+                            reject(new Error(`HTTP ${response.status}`));
+                        }
+                    },
+                    onerror: () => reject(new Error('网络错误'))
+                });
+            });
+            setProgress(50);
+
+            setStatus('请求第二段数据...');
+            const downloadLink = midiLink
+                .replace(/^tokeno#:@!/, "token")
+                .replace("https://www.midishow.com", "https://s.midishow.net")
+                .replace(".mid?", ".js?");
+
+            const data2 = await new Promise((resolve, reject) => {
+                GM_xmlhttpRequest({
+                    method: 'GET',
+                    url: downloadLink,
+                    headers: {
+                        'X-CSRF-TOKEN': csrf,
+                        'X-Requested-With': 'XMLHttpRequest',
+                        'Cookie': cookies
+                    },
+                    anonymous: false,
+                    onload: (response) => {
+                        if (response.status === 200) {
+                            resolve(response.responseText);
+                        } else {
+                            reject(new Error(`HTTP ${response.status}`));
+                        }
+                    },
+                    onerror: () => reject(new Error('网络错误'))
+                });
+            });
+            setProgress(70);
+
+            setStatus('解密重组...');
+            const de_e = etagDecode(data1.etag) + data1.data.substring(56);
+            const midiContent = de(data1.data.substring(28, 56), de_e)
+                + de(data2.substring(3, data2.length - 5), de_e)
+                + de(data1.data.substring(0, 28), de_e);
+
+            if (midiContent.substring(0, 4) !== 'MThd') {
+                throw new Error('无效的 MIDI 文件');
+            }
+            setProgress(90);
+
+            setStatus('下载中...');
+            const bytes = new Uint8Array(midiContent.length);
+            for (let i = 0; i < midiContent.length; i++) {
+                bytes[i] = midiContent.charCodeAt(i);
+            }
+            const blob = new Blob([bytes], { type: 'audio/midi' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `${id}.mid`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+
+            setProgress(100);
+            setStatus('✅ 下载成功！');
+            GM_notification({
+                title: 'MidiShow 下载器',
+                text: `MIDI #${id} 下载成功！`,
+                timeout: 4000
+            });
+
+            // 3秒后自动隐藏
+            setTimeout(hideUI, 5000);
+
+        } catch (error) {
+            setStatus('❌ 失败: ' + error.message);
+            setProgress(0);
+            GM_notification({
+                title: 'MidiShow 下载器',
+                text: `下载失败: ${error.message}`,
+                timeout: 5000
+            });
+            // 保留显示错误，点击可关闭（或延迟隐藏）
+            setTimeout(hideUI, 8000);
+        }
+    }
+
+    // ========== 自动跳转与自动下载 ==========
+
+    function handleAutoDownload() {
+        // 若当前是下载页，则跳转到详情页并标记自动下载
+        if (isDownloadPage()) {
+            const id = getMidiId();
+            if (id) {
+                sessionStorage.setItem('midi_auto_download', 'true');
+                window.location.href = `https://www.midishow.com/midi/${id}.html`;
+            }
+            return;
+        }
+
+        // 若存在自动下载标记，则触发下载
+        const autoFlag = sessionStorage.getItem('midi_auto_download');
+        if (autoFlag === 'true') {
+            sessionStorage.removeItem('midi_auto_download');
+            const id = getMidiId();
+            if (id) {
+                // 延迟确保页面完整加载
+                setTimeout(() => handleDownload(id), 500);
+            }
+        }
+    }
+
+    // ========== 菜单命令 ==========
+
+    GM_registerMenuCommand('下载当前 MIDI', function() {
+        const id = getMidiId();
+        if (id) {
+            handleDownload(id);
+        } else {
+            GM_notification({
+                title: 'MidiShow 下载器',
+                text: '未找到 MIDI ID，请确保在详情页。',
+                timeout: 3000
+            });
+        }
+    });
+
+    // ========== 初始化 ==========
+
+    function init() {
+        createUI();
+        // 先隐藏UI（初始状态）
+        hideUI();
+        // 处理自动跳转/下载
+        handleAutoDownload();
+        console.log('MidiShow 下载器已启动 (自动 + 菜单)');
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
+    }
+
+})();
